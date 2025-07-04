@@ -15,16 +15,18 @@ be general should you wish to use a custom dataset.
 
 ## Contents
 
-* [Setup](#Setup)
-  * [Convert](#convert)
-* [Run](#Run)
-  * [Fine-tune](#Fine-tune)
-  * [Evaluate](#Evaluate)
-  * [Generate](#Generate)
-* [Results](#Results)
-* [Fuse and Upload](#Fuse-and-Upload)
-* [Custom Data](#Custom-Data)
-* [Memory Issues](#Memory-Issues)
+- [Fine-Tuning with LoRA or QLoRA](#fine-tuning-with-lora-or-qlora)
+  - [Contents](#contents)
+  - [Setup](#setup)
+    - [Convert](#convert)
+  - [Run](#run)
+    - [Fine-tune](#fine-tune)
+    - [Evaluate](#evaluate)
+    - [Generate](#generate)
+  - [Results](#results)
+  - [Fuse and Upload](#fuse-and-upload)
+  - [Custom Data](#custom-data)
+  - [Memory Issues](#memory-issues)
 
 
 ## Setup 
@@ -83,9 +85,12 @@ Face repo or a local path to a converted mdoel.
 To fine-tune a model use:
 
 ```
-python lora.py --model <path_to_model> \
+python lora.py --model mlx-community/gemma-3n-E2B-it-lm-4bit \
                --train \
-               --iters 600
+               --iters 50 \
+               --save-every 5 \
+               --adapter-file ./adapters.npz
+
 ```
 
 If `--model` points to a quantized model, then the training will use QLoRA,
