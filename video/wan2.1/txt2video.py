@@ -89,7 +89,7 @@ if __name__ == "__main__":
         handler.setFormatter(logging.Formatter("%(message)s"))
         logging.getLogger("wan").setLevel(logging.INFO)
         logging.getLogger("wan").addHandler(handler)
-
+    print(f"Generating video with prompt: {args.prompt}")
     # Load pipeline
     pipeline = WanPipeline(args.model, checkpoint=args.checkpoint)
 
@@ -99,6 +99,7 @@ if __name__ == "__main__":
         print(f"Quantized DiT to {args.quantize}-bit")
 
     if args.preload_models:
+        print("Preloading models...")
         pipeline.ensure_models_are_loaded()
 
     # Generate latents (generator pattern matching flux)
@@ -115,13 +116,14 @@ if __name__ == "__main__":
         verbose=args.verbose,
         denoising_step_list=denoising_step_list,
     )
-
+    print("Generating video...")
     # 1. Conditioning
     conditioning = next(latents)
     mx.eval(conditioning)
     peak_mem_conditioning = mx.get_peak_memory() / 1024**3
     mx.reset_peak_memory()
 
+    print("Denoising...")
     # Free T5 memory
     del pipeline.t5
     mx.clear_cache()
@@ -135,12 +137,14 @@ if __name__ == "__main__":
     mx.clear_cache()
     peak_mem_generation = mx.get_peak_memory() / 1024**3
     mx.reset_peak_memory()
-
+    
+    print("Decoding video...")
     # 3. VAE decode
     video = pipeline.decode(x_t)
     mx.eval(video)
     peak_mem_decoding = mx.get_peak_memory() / 1024**3
 
+    print(f"Video generated: {args.output} ({video.shape[0]} frames, {video.shape[2]}x{video.shape[3]})")
     # Save video
     save_video(video, args.output)
 
