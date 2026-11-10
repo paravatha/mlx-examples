@@ -22,6 +22,71 @@ from .vae_layers import (
 )
 
 
+class DupUp3D(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        factor_t: int,
+        factor_s: int = 1,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.factor_t = factor_t
+        self.factor_s = factor_s
+        self.factor = factor_t * factor_s * factor_s
+        assert out_channels * self.factor % in_channels == 0
+        self.repeats = out_channels * self.factor // in_channels
+
+    def __call__(self, x: mx.array, first_chunk: bool = False) -> mx.array:
+        B, T, H, W, C = x.shape
+        x = mx.repeat(x, self.repeats, axis=-1)
+        x = x.reshape(B, T, H, W, self.out_channels, self.factor_t, self.factor_s, self.factor_s)
+        x = x.transpose(0, 1, 5, 2, 6, 3, 7, 4)
+        x = x.reshape(B, T * self.factor_t, H * self.factor_s, W * self.factor_s, self.out_channels)
+        if first_chunk:
+            x = x[:, self.factor_t - 1 :, :, :, :]
+        return x
+
+
+class AvgDown3D(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        factor_t: int,
+        factor_s: int = 1,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.factor_t = factor_t
+        self.factor_s = factor_s
+        self.factor = factor_t * factor_s * factor_s
+        assert in_channels * self.factor % out_channels == 0
+        self.group_size = in_channels * self.factor // out_channels
+
+    def __call__(self, x: mx.array) -> mx.array:
+        pad_t = (self.factor_t - x.shape[1] % self.factor_t) % self.factor_t
+        if pad_t > 0:
+            x = mx.pad(x, [(0, 0), (pad_t, 0), (0, 0), (0, 0), (0, 0)])
+        B, T, H, W, C = x.shape
+        x = x.reshape(
+            B,
+            T // self.factor_t,
+            self.factor_t,
+            H // self.factor_s,
+            self.factor_s,
+            W // self.factor_s,
+            self.factor_s,
+            C,
+        )
+        x = x.transpose(0, 1, 3, 5, 7, 2, 4, 6)
+        x = x.reshape(B, T // self.factor_t, H // self.factor_s, W // self.factor_s, self.out_channels, self.group_size)
+        return mx.mean(x, axis=-1)
+
+
 class Decoder3d(nn.Module):
     """
     VAE Decoder for video generation.
@@ -68,7 +133,9 @@ class Decoder3d(nn.Module):
 
         # Build upsample stages as nested lists
         self.upsamples = []
+        self.shortcuts = []
         for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
+            stage_in_dim = in_dim
             stage = []
             if i > 0 and not is_residual:
                 in_dim = in_dim // 2
@@ -77,12 +144,19 @@ class Decoder3d(nn.Module):
                 if scale in attn_scales:
                     stage.append(AttentionBlock(out_dim))
                 in_dim = out_dim
-            if i != len(dim_mult) - 1:
+            up_flag = i != len(dim_mult) - 1
+            if up_flag:
                 mode = "upsample3d" if temporal_upsample[i] else "upsample2d"
                 upsample_out_dim = out_dim if is_residual else None
                 stage.append(Resample(out_dim, mode=mode, out_dim=upsample_out_dim))
                 scale *= 2.0
             self.upsamples.append(stage)
+
+            if is_residual and up_flag:
+                factor_t = 2 if temporal_upsample[i] else 1
+                self.shortcuts.append(DupUp3D(stage_in_dim, out_dim, factor_t=factor_t, factor_s=2))
+            else:
+                self.shortcuts.append(None)
 
         self.head_norm = nn.RMSNorm(dims[-1], eps=1e-12)
         self.head_conv = CausalConv3d(dims[-1], out_channels, 3, padding=1)
@@ -98,7 +172,7 @@ class Decoder3d(nn.Module):
         n += 1  # head_conv
         self.num_cache_slots = n
 
-    def __call__(self, x, feat_cache):
+    def __call__(self, x, feat_cache, first_chunk: bool = False):
         cache_idx = 0
         new_cache = []
 
@@ -123,7 +197,8 @@ class Decoder3d(nn.Module):
         new_cache.append(c2)
         cache_idx += 2
 
-        for stage in self.upsamples:
+        for s_idx, stage in enumerate(self.upsamples):
+            x_copy = x
             for layer in stage:
                 if isinstance(layer, ResidualBlock):
                     x, c1, c2 = layer(
@@ -139,6 +214,8 @@ class Decoder3d(nn.Module):
                     if c is not None:
                         new_cache.append(c)
                         cache_idx += 1
+            if self.is_residual and self.shortcuts[s_idx] is not None:
+                x = x + self.shortcuts[s_idx](x_copy, first_chunk=first_chunk)
 
         x = self.head_norm(x)
         x = nn.silu(x)
@@ -167,6 +244,7 @@ class Encoder3d(nn.Module):
         attn_scales: Optional[List[float]] = None,
         temporal_downsample: Optional[List[bool]] = None,
         in_channels: int = 3,
+        is_residual: bool = False,
     ):
         super().__init__()
         if dim_mult is None:
@@ -182,6 +260,7 @@ class Encoder3d(nn.Module):
         self.num_res_blocks = num_res_blocks
         self.temporal_downsample = temporal_downsample
         self.in_channels = in_channels
+        self.is_residual = is_residual
 
         dims = [dim * u for u in [1] + dim_mult]
         scale = 1.0
@@ -190,18 +269,28 @@ class Encoder3d(nn.Module):
 
         # Build downsample stages as nested lists
         self.downsamples = []
+        self.shortcuts = []
         for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
+            stage_in_dim = in_dim
             stage = []
             for j in range(num_res_blocks):
                 stage.append(ResidualBlock(in_dim, out_dim))
                 if scale in attn_scales:
                     stage.append(AttentionBlock(out_dim))
                 in_dim = out_dim
-            if i != len(dim_mult) - 1:
+            down_flag = i != len(dim_mult) - 1
+            if down_flag:
                 mode = "downsample3d" if temporal_downsample[i] else "downsample2d"
                 stage.append(Resample(out_dim, mode=mode))
                 scale /= 2.0
             self.downsamples.append(stage)
+
+            if is_residual:
+                factor_t = (2 if temporal_downsample[i] else 1) if down_flag else 1
+                factor_s = 2 if down_flag else 1
+                self.shortcuts.append(AvgDown3D(stage_in_dim, out_dim, factor_t=factor_t, factor_s=factor_s))
+            else:
+                self.shortcuts.append(None)
 
         self.middle_res1 = ResidualBlock(dims[-1], dims[-1])
         self.middle_attn = AttentionBlock(dims[-1])
@@ -230,7 +319,8 @@ class Encoder3d(nn.Module):
         new_cache.append(create_cache_entry(cache_input, feat_cache[cache_idx]))
         cache_idx += 1
 
-        for stage in self.downsamples:
+        for s_idx, stage in enumerate(self.downsamples):
+            x_copy = x
             for layer in stage:
                 if isinstance(layer, ResidualBlock):
                     x, c1, c2 = layer(
@@ -246,6 +336,8 @@ class Encoder3d(nn.Module):
                     if c is not None:
                         new_cache.append(c)
                         cache_idx += 1
+            if self.is_residual and self.shortcuts[s_idx] is not None:
+                x = x + self.shortcuts[s_idx](x_copy)
 
         x, c1, c2 = self.middle_res1(
             x, feat_cache[cache_idx], feat_cache[cache_idx + 1]
@@ -356,7 +448,12 @@ class WanVAE(nn.Module):
         self.is_residual = is_residual
 
         dec_dim = decoder_dim if decoder_dim is not None else dim
-        self.encoder = Encoder3d(dim=dim, z_dim=z_dim, in_channels=in_channels)
+        self.encoder = Encoder3d(
+            dim=dim,
+            z_dim=z_dim,
+            in_channels=in_channels,
+            is_residual=is_residual,
+        )
         self.conv1 = CausalConv3d(z_dim * 2, z_dim * 2, 1)
         self.decoder = Decoder3d(
             dim=dec_dim,
@@ -373,7 +470,12 @@ class WanVAE(nn.Module):
             self.mean = mx.array(WAN21_VAE_MEAN)
             self.std = mx.array(WAN21_VAE_STD)
         # Pre-compile for the frame-by-frame loop: avoids recompiling each frame.
-        self._compiled_decode = mx.compile(self.decoder.__call__)
+        self._compiled_decode_first = mx.compile(
+            lambda x, c: self.decoder(x, c, first_chunk=True)
+        )
+        self._compiled_decode_rest = mx.compile(
+            lambda x, c: self.decoder(x, c, first_chunk=False)
+        )
         self._compiled_encode = mx.compile(self.encoder.__call__)
 
     def decode(self, z: mx.array) -> mx.array:
@@ -386,6 +488,8 @@ class WanVAE(nn.Module):
         Returns:
             Video tensor [F, H, W, C] clamped to [-1, 1] (channels-last)
         """
+        if z.ndim == 3:
+            z = z[None]
         # Add batch dim: [F, H, W, C] -> [1, F, H, W, C]
         z = z[None]
 
@@ -405,7 +509,10 @@ class WanVAE(nn.Module):
 
         for i in range(num_frames):
             frame = x[:, i : i + 1, :, :, :]
-            out_frame, feat_cache = self._compiled_decode(frame, feat_cache)
+            decode_fn = (
+                self._compiled_decode_first if i == 0 else self._compiled_decode_rest
+            )
+            out_frame, feat_cache = decode_fn(frame, feat_cache)
             mx.eval(out_frame)
             outputs.append(out_frame)
 
@@ -427,6 +534,8 @@ class WanVAE(nn.Module):
         Returns:
             Latent tensor [F', H/8, W/8, C] (channels-last)
         """
+        if x.ndim == 3:
+            x = x[None]
         # Add batch dim: [F, H, W, C] -> [1, F, H, W, C]
         if self.in_channels == 12:
             x = patchify_3d_channels_last(x[None], 2)

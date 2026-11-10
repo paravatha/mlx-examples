@@ -13,7 +13,7 @@ from wan.utils import save_video
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Generate videos from text using Wan2.1"
+        description="Generate videos from text using Wan2.2"
     )
     parser.add_argument("prompt")
     parser.add_argument(
@@ -28,8 +28,8 @@ if __name__ == "__main__":
             "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
             "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
         ],
-        default="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
-        help="Model variant (default: Wan-AI/Wan2.2-TI2V-5B-Diffusers)",
+        default="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+        help="Model variant (default: Wan-AI/Wan2.2-T2V-A14B-Diffusers)",
     )
     parser.add_argument(
         "--size",
@@ -162,7 +162,7 @@ if __name__ == "__main__":
     mx.clear_cache()
     peak_mem_generation = mx.get_peak_memory() / 1024**3
     mx.reset_peak_memory()
-    
+
     # 3. VAE decode
     print("[Stage 4/5] Decoding video frames with VAE...")
     video = pipeline.decode(x_t)
@@ -170,7 +170,9 @@ if __name__ == "__main__":
     peak_mem_decoding = mx.get_peak_memory() / 1024**3
 
     # Save video
-    print(f"[Stage 5/5] Saving video to {args.output} ({video.shape[0]} frames, {video.shape[2]}x{video.shape[1]})...")
+    print(
+        f"[Stage 5/5] Saving video to {args.output} ({video.shape[0]} frames, {video.shape[2]}x{video.shape[1]})..."
+    )
     save_video(video, args.output)
 
     if args.verbose:
