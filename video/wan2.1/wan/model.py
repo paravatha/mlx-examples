@@ -207,6 +207,50 @@ class WanModel(nn.Module):
             if new_key.startswith("model."):
                 new_key = new_key[6:]
 
+            # Diffusers format mappings
+            if "condition_embedder." in new_key:
+                new_key = new_key.replace("condition_embedder.time_embedder.linear_1.", "time_embedding.layers.0.")
+                new_key = new_key.replace("condition_embedder.time_embedder.linear_2.", "time_embedding.layers.2.")
+                new_key = new_key.replace("condition_embedder.text_embedder.linear_1.", "text_embedding.layers.0.")
+                new_key = new_key.replace("condition_embedder.text_embedder.linear_2.", "text_embedding.layers.2.")
+                new_key = new_key.replace("condition_embedder.time_proj.", "time_projection.layers.1.")
+                new_key = new_key.replace("condition_embedder.image_embedder.norm1.", "img_emb_norm1.")
+                new_key = new_key.replace("condition_embedder.image_embedder.ff.net.0.proj.", "img_emb_linear1.")
+                new_key = new_key.replace("condition_embedder.image_embedder.ff.net.2.", "img_emb_linear2.")
+                new_key = new_key.replace("condition_embedder.image_embedder.norm2.", "img_emb_norm2.")
+
+            if new_key in ("scale_shift_table", "head.scale_shift_table"):
+                new_key = "head.modulation"
+
+            if "scale_shift_table" in new_key:
+                new_key = re.sub(r"blocks\.(\d+)\.scale_shift_table", r"blocks.\1.modulation", new_key)
+
+            if "proj_out." in new_key:
+                new_key = new_key.replace("proj_out.", "head.linear.")
+
+            if ".attn1." in new_key:
+                new_key = re.sub(r"blocks\.(\d+)\.attn1\.to_q\.", r"blocks.\1.self_attn.q.", new_key)
+                new_key = re.sub(r"blocks\.(\d+)\.attn1\.to_k\.", r"blocks.\1.self_attn.k.", new_key)
+                new_key = re.sub(r"blocks\.(\d+)\.attn1\.to_v\.", r"blocks.\1.self_attn.v.", new_key)
+                new_key = re.sub(r"blocks\.(\d+)\.attn1\.to_out\.0\.", r"blocks.\1.self_attn.o.", new_key)
+                new_key = re.sub(r"blocks\.(\d+)\.attn1\.norm_q\.", r"blocks.\1.self_attn.norm_q.", new_key)
+                new_key = re.sub(r"blocks\.(\d+)\.attn1\.norm_k\.", r"blocks.\1.self_attn.norm_k.", new_key)
+
+            if ".attn2." in new_key:
+                new_key = re.sub(r"blocks\.(\d+)\.attn2\.to_q\.", r"blocks.\1.cross_attn.q.", new_key)
+                new_key = re.sub(r"blocks\.(\d+)\.attn2\.to_k\.", r"blocks.\1.cross_attn.k.", new_key)
+                new_key = re.sub(r"blocks\.(\d+)\.attn2\.to_v\.", r"blocks.\1.cross_attn.v.", new_key)
+                new_key = re.sub(r"blocks\.(\d+)\.attn2\.to_out\.0\.", r"blocks.\1.cross_attn.o.", new_key)
+                new_key = re.sub(r"blocks\.(\d+)\.attn2\.norm_q\.", r"blocks.\1.cross_attn.norm_q.", new_key)
+                new_key = re.sub(r"blocks\.(\d+)\.attn2\.norm_k\.", r"blocks.\1.cross_attn.norm_k.", new_key)
+
+            if ".norm2." in new_key:
+                new_key = re.sub(r"blocks\.(\d+)\.norm2\.", r"blocks.\1.norm3.", new_key)
+
+            if "ffn.net." in new_key:
+                new_key = re.sub(r"blocks\.(\d+)\.ffn\.net\.0\.proj\.", r"blocks.\1.ffn.layers.0.", new_key)
+                new_key = re.sub(r"blocks\.(\d+)\.ffn\.net\.2\.", r"blocks.\1.ffn.layers.2.", new_key)
+
             # PyTorch Conv3d [O,I,kT,kH,kW] -> MLX Conv3d [O,kT,kH,kW,I]
             if (
                 "patch_embedding" in new_key

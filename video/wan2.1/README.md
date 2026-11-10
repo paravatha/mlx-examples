@@ -10,6 +10,8 @@ Hub](https://huggingface.co/Wan-AI).
 | 1.3B | T2V | [Wan-AI/Wan2.1-T2V-1.3B](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B) | ~10GB | ~90 s/it |
 | 14B | T2V | [Wan-AI/Wan2.1-T2V-14B](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B) | ~36GB | ~230 s/it |
 | 14B | I2V | [Wan-AI/Wan2.1-I2V-14B-480P](https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-480P) | ~39GB | ~250 s/it |
+| 2.2 TI2V 5B | T2V / I2V | [Wan-AI/Wan2.2-TI2V-5B-Diffusers](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers) | ~18GB | ~120 s/it |
+| 2.2 T2V A14B | T2V (MoE) | [Wan-AI/Wan2.2-T2V-A14B-Diffusers](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers) | ~40GB | ~240 s/it |
 
 | T2V 1.3B | T2V 14B | I2V 14B |
 |---|---|---|
@@ -44,6 +46,18 @@ python txt2video.py 'A cat playing piano' \
     --model t2v-14B --quantize --output out_14B.mp4
 ```
 
+Use the Wan2.2 models:
+
+```shell
+# Wan 2.2 TI2V 5B (Diffusers)
+python txt2video.py 'A cat playing piano' \
+    --model Wan-AI/Wan2.2-TI2V-5B-Diffusers --quantize --output out_5B.mp4
+
+# Wan 2.2 T2V A14B (Diffusers MoE)
+python txt2video.py 'A cat playing piano' \
+    --model Wan-AI/Wan2.2-T2V-A14B-Diffusers --quantize --output out_a14B.mp4
+```
+
 Adjust resolution, frame count, and sampling parameters:
 
 ```shell
@@ -59,8 +73,13 @@ For more parameters, use `python txt2video.py --help`.
 Generate a video from an input image:
 
 ```shell
+# Using Wan 2.1 I2V 14B
 python img2video.py 'Astronaut riding a horse' \
     --image ./inputs/astronaut-on-a-horse.png --quantize --output out_i2v.mp4
+
+# Using Wan 2.2 TI2V 5B
+python img2video.py 'Astronaut riding a horse' \
+    --image ./inputs/astronaut-on-a-horse.png --model Wan-AI/Wan2.2-TI2V-5B-Diffusers --quantize --output out_5B.mp4
 ```
 
 Adjust resolution and sampling parameters:

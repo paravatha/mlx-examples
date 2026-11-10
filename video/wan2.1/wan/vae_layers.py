@@ -8,6 +8,7 @@ All layers use channels-last format (NTHWC) as required by MLX.
 
 import mlx.core as mx
 import mlx.nn as nn
+from typing import Optional
 
 # Temporal cache depth: 2 frames for causal conv with kernel_size=3 along time.
 CACHE_T = 2
@@ -96,7 +97,7 @@ class CausalConv3d(nn.Module):
 
 
 class Resample(nn.Module):
-    def __init__(self, dim, mode):
+    def __init__(self, dim: int, mode: str, out_dim: Optional[int] = None):
         assert mode in (
             "upsample2d",
             "upsample3d",
@@ -106,16 +107,18 @@ class Resample(nn.Module):
         super().__init__()
         self.dim = dim
         self.mode = mode
+        if out_dim is None:
+            out_dim = dim // 2 if mode in ("upsample2d", "upsample3d") else dim
 
         if mode == "upsample2d":
             self.upsample = nn.Upsample(scale_factor=(2.0, 2.0), mode="nearest")
             self.conv = nn.Conv2d(
-                dim, dim // 2, kernel_size=3, stride=1, padding=0, bias=True
+                dim, out_dim, kernel_size=3, stride=1, padding=0, bias=True
             )
         elif mode == "upsample3d":
             self.upsample = nn.Upsample(scale_factor=(2.0, 2.0), mode="nearest")
             self.conv = nn.Conv2d(
-                dim, dim // 2, kernel_size=3, stride=1, padding=0, bias=True
+                dim, out_dim, kernel_size=3, stride=1, padding=0, bias=True
             )
             self.time_conv = CausalConv3d(dim, dim * 2, (3, 1, 1), padding=(1, 0, 0))
         elif mode in ("downsample2d", "downsample3d"):

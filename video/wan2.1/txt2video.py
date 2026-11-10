@@ -16,7 +16,21 @@ if __name__ == "__main__":
         description="Generate videos from text using Wan2.1"
     )
     parser.add_argument("prompt")
-    parser.add_argument("--model", choices=["t2v-1.3B", "t2v-14B"], default="t2v-1.3B")
+    parser.add_argument(
+        "--model",
+        choices=[
+            "t2v-1.3B",
+            "t2v-14B",
+            "t2v-A14B",
+            "ti2v-5B",
+            "Wan2.2-T2V-A14B",
+            "Wan2.2-TI2V-5B",
+            "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+            "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+        ],
+        default="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+        help="Model variant (default: Wan-AI/Wan2.2-TI2V-5B-Diffusers)",
+    )
     parser.add_argument(
         "--size",
         type=lambda x: tuple(map(int, x.split("x"))),
@@ -89,17 +103,23 @@ if __name__ == "__main__":
         handler.setFormatter(logging.Formatter("%(message)s"))
         logging.getLogger("wan").setLevel(logging.INFO)
         logging.getLogger("wan").addHandler(handler)
-    print(f"Generating video with prompt: {args.prompt}")
+    print(f"Generating video with prompt: '{args.prompt}'")
     # Load pipeline
+    print(f"[Stage 1/5] Loading pipeline ({args.model})...")
     pipeline = WanPipeline(args.model, checkpoint=args.checkpoint)
 
     # Quantize DiT
     if args.quantize:
-        nn.quantize(pipeline.flow, bits=args.quantize)
-        print(f"Quantized DiT to {args.quantize}-bit")
+        if getattr(pipeline, "is_moe", False):
+            nn.quantize(pipeline.flow_high, bits=args.quantize)
+            nn.quantize(pipeline.flow_low, bits=args.quantize)
+            print(f"Quantized both MoE DiT experts to {args.quantize}-bit")
+        else:
+            nn.quantize(pipeline.flow, bits=args.quantize)
+            print(f"Quantized DiT to {args.quantize}-bit")
 
     if args.preload_models:
-        print("Preloading models...")
+        print("Preloading models into memory...")
         pipeline.ensure_models_are_loaded()
 
     # Generate latents (generator pattern matching flux)
@@ -116,36 +136,41 @@ if __name__ == "__main__":
         verbose=args.verbose,
         denoising_step_list=denoising_step_list,
     )
-    print("Generating video...")
+
     # 1. Conditioning
+    print("[Stage 2/5] Computing text conditioning embeddings...")
     conditioning = next(latents)
     mx.eval(conditioning)
     peak_mem_conditioning = mx.get_peak_memory() / 1024**3
     mx.reset_peak_memory()
 
-    print("Denoising...")
     # Free T5 memory
     del pipeline.t5
     mx.clear_cache()
 
     # 2. Denoising loop
+    print(f"[Stage 3/5] Denoising latents ({args.steps} steps)...")
     for x_t in tqdm(latents, total=args.steps):
         mx.eval(x_t)
 
     # Free DiT memory
-    del pipeline.flow
+    if getattr(pipeline, "is_moe", False):
+        del pipeline.flow_high
+        del pipeline.flow_low
+    else:
+        del pipeline.flow
     mx.clear_cache()
     peak_mem_generation = mx.get_peak_memory() / 1024**3
     mx.reset_peak_memory()
     
-    print("Decoding video...")
     # 3. VAE decode
+    print("[Stage 4/5] Decoding video frames with VAE...")
     video = pipeline.decode(x_t)
     mx.eval(video)
     peak_mem_decoding = mx.get_peak_memory() / 1024**3
 
-    print(f"Video generated: {args.output} ({video.shape[0]} frames, {video.shape[2]}x{video.shape[3]})")
     # Save video
+    print(f"[Stage 5/5] Saving video to {args.output} ({video.shape[0]} frames, {video.shape[2]}x{video.shape[1]})...")
     save_video(video, args.output)
 
     if args.verbose:

@@ -32,7 +32,64 @@ class ModelSpec:
     repo_tokenizer: str = "google/umt5-xxl/tokenizer.json"
     repo_clip: Optional[str] = None
     ckpt_path: Optional[str] = None
+    repo_dit_2: Optional[str] = None
+    is_moe: bool = False
+    boundary_ratio: Optional[float] = None
+    vae_params: Optional[Dict] = None
+    vae_repo_id: Optional[str] = None
+    t5_repo_id: Optional[str] = None
+    tokenizer_repo_id: Optional[str] = None
 
+
+spec_t2v_a14b = ModelSpec(
+    repo_id="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+    repo_dit="transformer/diffusion_pytorch_model.safetensors.index.json",
+    repo_dit_2="transformer_2/diffusion_pytorch_model.safetensors.index.json",
+    repo_vae="Wan2.1_VAE.pth",
+    vae_repo_id="Wan-AI/Wan2.1-T2V-14B",
+    repo_t5="models_t5_umt5-xxl-enc-bf16.pth",
+    t5_repo_id="Wan-AI/Wan2.1-T2V-1.3B",
+    tokenizer_repo_id="Wan-AI/Wan2.1-T2V-1.3B",
+    is_moe=True,
+    boundary_ratio=0.875,
+    dit_params={
+        "dim": 5120,
+        "ffn_dim": 13824,
+        "num_heads": 40,
+        "num_layers": 40,
+        "in_dim": 16,
+        "out_dim": 16,
+    },
+    vae_params={"z_dim": 16, "dim": 96},
+    ckpt_path=os.getenv("WAN_T2V_A14B"),
+)
+
+spec_ti2v_5b = ModelSpec(
+    repo_id="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+    repo_dit="transformer/diffusion_pytorch_model.safetensors.index.json",
+    repo_vae="vae/diffusion_pytorch_model.safetensors",
+    repo_t5="models_t5_umt5-xxl-enc-bf16.pth",
+    t5_repo_id="Wan-AI/Wan2.1-T2V-1.3B",
+    tokenizer_repo_id="Wan-AI/Wan2.1-T2V-1.3B",
+    is_moe=False,
+    dit_params={
+        "dim": 3072,
+        "ffn_dim": 14336,
+        "num_heads": 24,
+        "num_layers": 30,
+        "in_dim": 48,
+        "out_dim": 48,
+    },
+    vae_params={
+        "z_dim": 48,
+        "dim": 160,
+        "decoder_dim": 256,
+        "in_channels": 12,
+        "out_channels": 12,
+        "is_residual": True,
+    },
+    ckpt_path=os.getenv("WAN_TI2V_5B"),
+)
 
 configs = {
     "t2v-1.3B": ModelSpec(
@@ -67,6 +124,14 @@ configs = {
         },
         ckpt_path=os.getenv("WAN_I2V_14B"),
     ),
+    # Wan 2.2 TI2V-5B
+    "Wan-AI/Wan2.2-TI2V-5B-Diffusers": spec_ti2v_5b,
+    "Wan2.2-TI2V-5B": spec_ti2v_5b,
+    "ti2v-5B": spec_ti2v_5b,
+    # Wan 2.2 T2V-A14B (MoE)
+    "Wan-AI/Wan2.2-T2V-A14B-Diffusers": spec_t2v_a14b,
+    "Wan2.2-T2V-A14B": spec_t2v_a14b,
+    "t2v-A14B": spec_t2v_a14b,
 }
 
 
@@ -94,7 +159,17 @@ def _load_weights(path: str) -> dict:
                 for i, p in enumerate(parts):
                     if p.startswith("models--"):
                         repo_id = p.replace("models--", "").replace("--", "/")
-                        _hf_download(repo_id, wf)
+                        snapshot_idx = -1
+                        for j in range(i, len(parts)):
+                            if parts[j] == "snapshots" and j + 1 < len(parts):
+                                snapshot_idx = j + 1
+                                break
+                        if snapshot_idx != -1 and snapshot_idx < len(parts) - 1:
+                            subfolder = "/".join(parts[snapshot_idx + 1 : -1])
+                            hf_filename = f"{subfolder}/{wf}" if subfolder else wf
+                        else:
+                            hf_filename = wf
+                        _hf_download(repo_id, hf_filename)
                         break
         weights = {}
         for wf in weight_files:
@@ -113,13 +188,29 @@ def _load_weights(path: str) -> dict:
         return mx.load(path)
 
 
-def load_dit(name: str, checkpoint: Optional[str] = None) -> WanModel:
+def load_dit(
+    name: str, checkpoint: Optional[str] = None, expert: Optional[str] = None
+) -> WanModel:
     """Load DiT model with weights from HF Hub."""
     spec = configs[name]
     model = WanModel(**spec.dit_params)
     ckpt_path = checkpoint or spec.ckpt_path
     if ckpt_path is None:
-        ckpt_path = _hf_download(spec.repo_id, spec.repo_dit)
+        target_dit = (
+            spec.repo_dit_2 if (expert == "low" and spec.repo_dit_2) else spec.repo_dit
+        )
+        try:
+            ckpt_path = _hf_download(spec.repo_id, target_dit)
+        except Exception:
+            # Fallback if single safetensors vs sharded index.json
+            if target_dit.endswith(".index.json"):
+                alt_dit = target_dit.replace(".index.json", "")
+                ckpt_path = _hf_download(spec.repo_id, alt_dit)
+            elif target_dit.endswith(".safetensors"):
+                alt_dit = f"{target_dit}.index.json"
+                ckpt_path = _hf_download(spec.repo_id, alt_dit)
+            else:
+                raise
     weights = _load_weights(ckpt_path)
     weights = WanModel.sanitize(weights)
     model.load_weights(list(weights.items()), strict=True)
@@ -129,8 +220,17 @@ def load_dit(name: str, checkpoint: Optional[str] = None) -> WanModel:
 def load_vae(name: str) -> WanVAE:
     """Load VAE decoder with weights from HF Hub."""
     spec = configs[name]
-    vae = WanVAE()
-    ckpt_path = _hf_download(spec.repo_id, spec.repo_vae)
+    vae_params = spec.vae_params or {}
+    vae = WanVAE(**vae_params)
+    repo = spec.vae_repo_id or spec.repo_id
+    try:
+        ckpt_path = _hf_download(repo, spec.repo_vae)
+    except Exception:
+        if spec.repo_vae.endswith(".safetensors"):
+            # Fallback to .pth or Wan2.1_VAE.pth
+            ckpt_path = _hf_download("Wan-AI/Wan2.1-T2V-14B", "Wan2.1_VAE.pth")
+        else:
+            raise
     weights = _load_weights(ckpt_path)
     weights = WanVAE.sanitize(weights)
     vae.load_weights(list(weights.items()), strict=False)
@@ -141,7 +241,8 @@ def load_t5(name: str) -> T5Encoder:
     """Load T5 encoder with weights from HF Hub."""
     spec = configs[name]
     t5 = create_umt5_xxl_encoder()
-    weight_path = _hf_download(spec.repo_id, spec.repo_t5)
+    repo = spec.t5_repo_id or spec.repo_id
+    weight_path = _hf_download(repo, spec.repo_t5)
     weights = _load_weights(weight_path)
     weights = T5Encoder.sanitize(weights)
     t5.load_weights(list(weights.items()), strict=True)
@@ -166,7 +267,8 @@ def load_clip(name: str):
 def load_t5_tokenizer(name: str) -> T5Tokenizer:
     """Load T5 tokenizer from HF Hub."""
     spec = configs[name]
-    tok_path = _hf_download(spec.repo_id, spec.repo_tokenizer)
+    repo = spec.tokenizer_repo_id or spec.repo_id
+    tok_path = _hf_download(repo, spec.repo_tokenizer)
     return T5Tokenizer(tok_path)
 
 

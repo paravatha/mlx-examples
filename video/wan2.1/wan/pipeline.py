@@ -64,22 +64,47 @@ class WanPipeline:
         self.dtype = dtype
         self.name = name
         self.vae_stride = (4, 8, 8)
-        self.z_dim = 16
         self._null_context = None
 
-        self.flow = load_dit(name, checkpoint=checkpoint)
+        spec = configs[name]
+        self.spec = spec
+        self.is_moe = getattr(spec, "is_moe", False)
+
+        if self.is_moe:
+            self.flow_high = load_dit(name, checkpoint=checkpoint, expert="high")
+            self.flow_low = load_dit(name, checkpoint=checkpoint, expert="low")
+            self.flow = self.flow_high
+            self.boundary_ratio = getattr(spec, "boundary_ratio", 0.875)
+            self.boundary_timestep = 1000.0 * self.boundary_ratio
+        else:
+            self.flow = load_dit(name, checkpoint=checkpoint)
+            self.flow_high = None
+            self.flow_low = None
+            self.boundary_ratio = None
+            self.boundary_timestep = None
+
         self.vae = load_vae(name)
+        self.z_dim = getattr(self.vae, "z_dim", 16)
+        if getattr(self.vae, "out_channels", 3) == 12 or (
+            spec.vae_params and spec.vae_params.get("out_channels") == 12
+        ):
+            self.vae_stride = (4, 16, 16)
+        else:
+            self.vae_stride = (4, 8, 8)
         self.t5 = load_t5(name)
         self.t5_tokenizer = load_t5_tokenizer(name)
-        self.clip = load_clip(name) if configs[name].repo_clip else None
+        self.clip = load_clip(name) if spec.repo_clip else None
         self.sampler = FlowUniPCMultistepScheduler()
 
     def ensure_models_are_loaded(self):
         params = [
-            self.flow.parameters(),
             self.vae.parameters(),
             self.t5.parameters(),
         ]
+        if self.is_moe:
+            params.extend([self.flow_high.parameters(), self.flow_low.parameters()])
+        else:
+            params.append(self.flow.parameters())
         if self.clip is not None:
             params.append(self.clip.parameters())
         mx.eval(*params)
@@ -244,6 +269,12 @@ class WanPipeline:
             )
             teacache = 0.0
 
+        if teacache > 0 and (self.is_moe or self.name not in _tea_coeffs):
+            logger.warning(
+                f"TeaCache is not calibrated for {self.name}; disabling."
+            )
+            teacache = 0.0
+
         if seed is not None:
             mx.random.seed(seed)
 
@@ -287,7 +318,7 @@ class WanPipeline:
         # TeaCache state
         use_teacache = teacache > 0
         if use_teacache:
-            # Must run before mx.compile(self.flow.__call__) below, since
+            # Must run before compiling flow below, since
             # compute_time_embedding uses self.flow.state and mx.eval here
             # materializes those parameters.
             all_t_emb, all_e0, skip_mask = self._precompute_teacache(
@@ -303,17 +334,34 @@ class WanPipeline:
                     f"({100 * n_skip / num_steps:.0f}%)"
                 )
 
-        flow = mx.compile(self.flow.__call__, inputs=[self.flow.state])
+        if self.is_moe:
+            flow_high = mx.compile(
+                self.flow_high.__call__, inputs=[self.flow_high.state]
+            )
+            flow_low = mx.compile(
+                self.flow_low.__call__, inputs=[self.flow_low.state]
+            )
+        else:
+            flow = mx.compile(self.flow.__call__, inputs=[self.flow.state])
 
         x_t = x_T
         for step_idx, t in enumerate(sampler.timesteps):
             t_val = t.reshape(1).astype(mx.float32)
 
+            if self.is_moe:
+                curr_flow = (
+                    flow_high
+                    if t_val.item() >= self.boundary_timestep
+                    else flow_low
+                )
+            else:
+                curr_flow = flow
+
             if use_teacache:
                 precomputed = (all_t_emb[step_idx], all_e0[step_idx])
 
                 if skip_mask[step_idx]:
-                    noise_cond, _ = flow(
+                    noise_cond, _ = curr_flow(
                         x_t,
                         t=t_val,
                         context=context,
@@ -325,7 +373,7 @@ class WanPipeline:
                     if verbose:
                         logger.info(f"Step {step_idx}/{num_steps}: skip")
                 else:
-                    noise_cond, prev_residual_cond = flow(
+                    noise_cond, prev_residual_cond = curr_flow(
                         x_t,
                         t=t_val,
                         context=context,
@@ -341,7 +389,7 @@ class WanPipeline:
 
                 if guidance > 1.0:
                     if skip_mask[step_idx]:
-                        noise_uncond, _ = flow(
+                        noise_uncond, _ = curr_flow(
                             x_t,
                             t=t_val,
                             context=context_null,
@@ -351,7 +399,7 @@ class WanPipeline:
                             precomputed_time=precomputed,
                         )
                     else:
-                        noise_uncond, prev_residual_uncond = flow(
+                        noise_uncond, prev_residual_uncond = curr_flow(
                             x_t,
                             t=t_val,
                             context=context_null,
@@ -365,7 +413,7 @@ class WanPipeline:
                     noise_pred = noise_cond
             else:
                 # Standard path
-                noise_cond, _ = flow(
+                noise_cond, _ = curr_flow(
                     x_t,
                     t=t_val,
                     context=context,
@@ -374,7 +422,7 @@ class WanPipeline:
                 )
 
                 if guidance > 1.0:
-                    noise_uncond, _ = flow(
+                    noise_uncond, _ = curr_flow(
                         x_t,
                         t=t_val,
                         context=context_null,

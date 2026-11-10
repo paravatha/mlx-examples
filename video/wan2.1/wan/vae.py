@@ -38,6 +38,8 @@ class Decoder3d(nn.Module):
         num_res_blocks: int = 2,
         attn_scales: Optional[List[float]] = None,
         temporal_upsample: Optional[List[bool]] = None,
+        out_channels: int = 3,
+        is_residual: bool = False,
     ):
         super().__init__()
         if dim_mult is None:
@@ -52,6 +54,8 @@ class Decoder3d(nn.Module):
         self.dim_mult = dim_mult
         self.num_res_blocks = num_res_blocks
         self.temporal_upsample = temporal_upsample
+        self.out_channels = out_channels
+        self.is_residual = is_residual
 
         dims = [dim * u for u in [dim_mult[-1]] + dim_mult[::-1]]
         scale = 1.0 / 2 ** (len(dim_mult) - 2)
@@ -66,7 +70,7 @@ class Decoder3d(nn.Module):
         self.upsamples = []
         for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
             stage = []
-            if i == 1 or i == 2 or i == 3:
+            if i > 0 and not is_residual:
                 in_dim = in_dim // 2
             for j in range(num_res_blocks + 1):
                 stage.append(ResidualBlock(in_dim, out_dim))
@@ -75,12 +79,13 @@ class Decoder3d(nn.Module):
                 in_dim = out_dim
             if i != len(dim_mult) - 1:
                 mode = "upsample3d" if temporal_upsample[i] else "upsample2d"
-                stage.append(Resample(out_dim, mode=mode))
+                upsample_out_dim = out_dim if is_residual else None
+                stage.append(Resample(out_dim, mode=mode, out_dim=upsample_out_dim))
                 scale *= 2.0
             self.upsamples.append(stage)
 
         self.head_norm = nn.RMSNorm(dims[-1], eps=1e-12)
-        self.head_conv = CausalConv3d(dims[-1], 3, 3, padding=1)
+        self.head_conv = CausalConv3d(dims[-1], out_channels, 3, padding=1)
 
         # Count temporal cache slots from architecture
         n = 1 + 2 + 2  # conv1, middle_res1, middle_res2
@@ -161,6 +166,7 @@ class Encoder3d(nn.Module):
         num_res_blocks: int = 2,
         attn_scales: Optional[List[float]] = None,
         temporal_downsample: Optional[List[bool]] = None,
+        in_channels: int = 3,
     ):
         super().__init__()
         if dim_mult is None:
@@ -175,11 +181,12 @@ class Encoder3d(nn.Module):
         self.dim_mult = dim_mult
         self.num_res_blocks = num_res_blocks
         self.temporal_downsample = temporal_downsample
+        self.in_channels = in_channels
 
         dims = [dim * u for u in [1] + dim_mult]
         scale = 1.0
 
-        self.conv1 = CausalConv3d(3, dims[0], 3, padding=1)
+        self.conv1 = CausalConv3d(in_channels, dims[0], 3, padding=1)
 
         # Build downsample stages as nested lists
         self.downsamples = []
@@ -266,62 +273,105 @@ class Encoder3d(nn.Module):
         return x, new_cache
 
 
+WAN21_VAE_MEAN = [
+    -0.7571, -0.7089, -0.9113, 0.1075,
+    -0.1745,  0.9653, -0.1517, 1.5508,
+     0.4134, -0.0715,  0.5517, -0.3632,
+    -0.1922, -0.9497,  0.2503, -0.2921,
+]
+
+WAN21_VAE_STD = [
+    2.8184, 1.4541, 2.3275, 2.6558,
+    1.2196, 1.7708, 2.6052, 2.0743,
+    3.2687, 2.1526, 2.8652, 1.5579,
+    1.6382, 1.1253, 2.8251, 1.9160,
+]
+
+WAN22_VAE_MEAN = [
+    -0.2289, -0.0052, -0.1323, -0.2339, -0.2799, 0.0174, 0.1838, 0.1557,
+    -0.1382, 0.0542, 0.2813, 0.0891, 0.1570, -0.0098, 0.0375, -0.1825,
+    -0.2246, -0.1207, -0.0698, 0.5109, 0.2665, -0.2108, -0.2158, 0.2502,
+    -0.2055, -0.0322, 0.1109, 0.1567, -0.0729, 0.0899, -0.2799, -0.1230,
+    -0.0313, -0.1649, 0.0117, 0.0723, -0.2839, -0.2083, -0.0520, 0.3748,
+    0.0152, 0.1957, 0.1433, -0.2944, 0.3573, -0.0548, -0.1681, -0.0667,
+]
+
+WAN22_VAE_STD = [
+    0.4765, 1.0364, 0.4514, 1.1677, 0.5313, 0.4990, 0.4818, 0.5013,
+    0.8158, 1.0344, 0.5894, 1.0901, 0.6885, 0.6165, 0.8454, 0.4978,
+    0.5759, 0.3523, 0.7135, 0.6804, 0.5833, 1.4146, 0.8986, 0.5659,
+    0.7069, 0.5338, 0.4889, 0.4917, 0.4069, 0.4999, 0.6866, 0.4093,
+    0.5709, 0.6065, 0.6415, 0.4944, 0.5726, 1.2042, 0.5458, 1.6887,
+    0.3971, 1.0600, 0.3943, 0.5537, 0.5444, 0.4089, 0.7468, 0.7744,
+]
+
+
+def unpatchify_3d_channels_last(x: mx.array, patch_size: int = 2) -> mx.array:
+    """
+    Unpatchify for 3D video tensors in channels-last format.
+    Matches Diffusers AutoencoderKLWan unpatchify:
+    [B, T, H, W, C_patches] -> [B, T, H * patch_size, W * patch_size, C_patches // (patch_size * patch_size)]
+    """
+    B, T, H, W, C_patches = x.shape
+    C = C_patches // (patch_size * patch_size)
+    x = x.reshape(B, T, H, W, C, patch_size, patch_size)
+    x = x.transpose(0, 1, 2, 6, 3, 5, 4)
+    return x.reshape(B, T, H * patch_size, W * patch_size, C)
+
+
+def patchify_3d_channels_last(x: mx.array, patch_size: int = 2) -> mx.array:
+    """
+    Patchify for 3D video tensors in channels-last format.
+    Matches Diffusers AutoencoderKLWan patchify:
+    [B, T, H, W, C] -> [B, T, H // patch_size, W // patch_size, C * patch_size * patch_size]
+    """
+    B, T, H, W, C = x.shape
+    x = x.reshape(B, T, H // patch_size, patch_size, W // patch_size, patch_size, C)
+    x = x.transpose(0, 1, 2, 4, 6, 5, 3)
+    return x.reshape(B, T, H // patch_size, W // patch_size, C * patch_size * patch_size)
+
+
 class WanVAE(nn.Module):
     """
-    High-level VAE wrapper for Wan2.1.
+    High-level VAE wrapper for Wan models.
 
     Encode: [F, H, W, C] video -> [F', H/8, W/8, z_dim] latent
     Decode: [F, H, W, C] latent -> [F*4, H*8, W*8, 3] video clamped to [-1, 1]
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        z_dim: int = 16,
+        dim: int = 96,
+        decoder_dim: Optional[int] = None,
+        in_channels: int = 3,
+        out_channels: int = 3,
+        is_residual: bool = False,
+    ):
         super().__init__()
-        self.encoder = Encoder3d()
-        self.conv1 = CausalConv3d(32, 32, 1)
-        self.decoder = Decoder3d()
-        self.conv2 = CausalConv3d(16, 16, 1)
+        self.z_dim = z_dim
+        self.dim = dim
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.is_residual = is_residual
 
-        self.mean = mx.array(
-            [
-                -0.7571,
-                -0.7089,
-                -0.9113,
-                0.1075,
-                -0.1745,
-                0.9653,
-                -0.1517,
-                1.5508,
-                0.4134,
-                -0.0715,
-                0.5517,
-                -0.3632,
-                -0.1922,
-                -0.9497,
-                0.2503,
-                -0.2921,
-            ]
+        dec_dim = decoder_dim if decoder_dim is not None else dim
+        self.encoder = Encoder3d(dim=dim, z_dim=z_dim, in_channels=in_channels)
+        self.conv1 = CausalConv3d(z_dim * 2, z_dim * 2, 1)
+        self.decoder = Decoder3d(
+            dim=dec_dim,
+            z_dim=z_dim,
+            out_channels=out_channels,
+            is_residual=is_residual,
         )
-        self.std = mx.array(
-            [
-                2.8184,
-                1.4541,
-                2.3275,
-                2.6558,
-                1.2196,
-                1.7708,
-                2.6052,
-                2.0743,
-                3.2687,
-                2.1526,
-                2.8652,
-                1.5579,
-                1.6382,
-                1.1253,
-                2.8251,
-                1.9160,
-            ]
-        )
-        self.z_dim = 16
+        self.conv2 = CausalConv3d(z_dim, z_dim, 1)
+
+        if z_dim == 48:
+            self.mean = mx.array(WAN22_VAE_MEAN)
+            self.std = mx.array(WAN22_VAE_STD)
+        else:
+            self.mean = mx.array(WAN21_VAE_MEAN)
+            self.std = mx.array(WAN21_VAE_STD)
         # Pre-compile for the frame-by-frame loop: avoids recompiling each frame.
         self._compiled_decode = mx.compile(self.decoder.__call__)
         self._compiled_encode = mx.compile(self.encoder.__call__)
@@ -360,6 +410,8 @@ class WanVAE(nn.Module):
             outputs.append(out_frame)
 
         out = mx.concatenate(outputs, axis=1)
+        if self.out_channels == 12:
+            out = unpatchify_3d_channels_last(out, 2)
         out = mx.clip(out, -1.0, 1.0)
 
         # Remove batch dim: [1, F, H, W, C] -> [F, H, W, C]
@@ -376,7 +428,10 @@ class WanVAE(nn.Module):
             Latent tensor [F', H/8, W/8, C] (channels-last)
         """
         # Add batch dim: [F, H, W, C] -> [1, F, H, W, C]
-        x = x[None]
+        if self.in_channels == 12:
+            x = patchify_3d_channels_last(x[None], 2)
+        else:
+            x = x[None]
 
         num_frames = x.shape[1]
         feat_cache = [None] * self.encoder.num_cache_slots
@@ -416,6 +471,65 @@ class WanVAE(nn.Module):
     @staticmethod
     def sanitize(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         """Remap PyTorch VAE keys to MLX format."""
+        is_diffusers = any(
+            "up_blocks" in k or "down_blocks" in k or "post_quant_conv" in k
+            for k in weights
+        )
+
+        if is_diffusers:
+            remapped = {}
+            for key, value in weights.items():
+                new_key = key
+                new_key = new_key.replace("post_quant_conv.", "conv2.")
+                new_key = new_key.replace("quant_conv.", "conv1.")
+
+                new_key = new_key.replace("decoder.conv_in.", "decoder.conv1.")
+                new_key = new_key.replace("decoder.conv_out.", "decoder.head_conv.")
+                new_key = new_key.replace("decoder.norm_out.", "decoder.head_norm.")
+                new_key = new_key.replace("encoder.conv_in.", "encoder.conv1.")
+                new_key = new_key.replace("encoder.conv_out.", "encoder.head_conv.")
+                new_key = new_key.replace("encoder.norm_out.", "encoder.head_norm.")
+
+                new_key = new_key.replace("encoder.mid_block.resnets.0.", "encoder.middle_res1.")
+                new_key = new_key.replace("encoder.mid_block.attentions.0.", "encoder.middle_attn.")
+                new_key = new_key.replace("encoder.mid_block.resnets.1.", "encoder.middle_res2.")
+                new_key = new_key.replace("decoder.mid_block.resnets.0.", "decoder.middle_res1.")
+                new_key = new_key.replace("decoder.mid_block.attentions.0.", "decoder.middle_attn.")
+                new_key = new_key.replace("decoder.mid_block.resnets.1.", "decoder.middle_res2.")
+
+                # Decoder up_blocks: resnets and upsampler
+                new_key = re.sub(r"decoder\.up_blocks\.(\d+)\.resnets\.(\d+)\.", r"decoder.upsamples.\1.\2.", new_key)
+                new_key = re.sub(r"decoder\.up_blocks\.(\d+)\.upsampler\.resample\.1\.", r"decoder.upsamples.\1.3.conv.", new_key)
+                new_key = re.sub(r"decoder\.up_blocks\.(\d+)\.upsampler\.time_conv\.", r"decoder.upsamples.\1.3.time_conv.", new_key)
+
+                # Encoder down_blocks: resnets and downsampler
+                new_key = re.sub(r"encoder\.down_blocks\.(\d+)\.resnets\.(\d+)\.", r"encoder.downsamples.\1.\2.", new_key)
+                new_key = re.sub(r"encoder\.down_blocks\.(\d+)\.downsampler\.resample\.1\.", r"encoder.downsamples.\1.2.conv.", new_key)
+                new_key = re.sub(r"encoder\.down_blocks\.(\d+)\.downsampler\.time_conv\.", r"encoder.downsamples.\1.2.time_conv.", new_key)
+
+                new_key = new_key.replace(".conv_shortcut.", ".shortcut.")
+                new_key = new_key.replace(".gamma", ".weight")
+
+                # Transpose convolution weights
+                if "weight" in new_key:
+                    if len(value.shape) == 5:
+                        value = mx.transpose(value, (0, 2, 3, 4, 1))
+                    elif len(value.shape) == 4 and ("to_qkv" not in new_key and "proj" not in new_key):
+                        value = mx.transpose(value, (0, 2, 3, 1))
+
+                # Squeeze 1x1 conv weights to 2D for nn.Linear (to_qkv, proj)
+                if ("to_qkv" in new_key or "proj" in new_key) and "weight" in new_key:
+                    if len(value.shape) == 4 and value.shape[2] == 1 and value.shape[3] == 1:
+                        value = value.reshape(value.shape[0], value.shape[1])
+
+                # Squeeze norm weights to 1D
+                if "norm" in new_key and "weight" in new_key:
+                    if len(value.shape) > 1:
+                        value = mx.squeeze(value)
+
+                remapped[new_key] = value
+            return remapped
+
         remapped = {}
         for key, value in weights.items():
             new_key = key

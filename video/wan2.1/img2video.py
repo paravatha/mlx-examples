@@ -17,7 +17,17 @@ if __name__ == "__main__":
     )
     parser.add_argument("prompt")
     parser.add_argument("--image", required=True, help="Path to input image")
-    parser.add_argument("--model", choices=["i2v-14B"], default="i2v-14B")
+    parser.add_argument(
+        "--model",
+        choices=[
+            "i2v-14B",
+            "ti2v-5B",
+            "Wan2.2-TI2V-5B",
+            "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+        ],
+        default="i2v-14B",
+        help="Model variant (default: i2v-14B)",
+    )
     parser.add_argument(
         "--size",
         type=lambda x: tuple(map(int, x.split("x"))),
@@ -96,8 +106,13 @@ if __name__ == "__main__":
 
     # Quantize DiT
     if args.quantize:
-        nn.quantize(pipeline.flow, bits=args.quantize)
-        print(f"Quantized DiT to {args.quantize}-bit")
+        if getattr(pipeline, "is_moe", False):
+            nn.quantize(pipeline.flow_high, bits=args.quantize)
+            nn.quantize(pipeline.flow_low, bits=args.quantize)
+            print(f"Quantized both MoE DiT experts to {args.quantize}-bit")
+        else:
+            nn.quantize(pipeline.flow, bits=args.quantize)
+            print(f"Quantized DiT to {args.quantize}-bit")
 
     if args.preload_models:
         pipeline.ensure_models_are_loaded()
@@ -135,7 +150,11 @@ if __name__ == "__main__":
         mx.eval(x_t)
 
     # Free DiT memory
-    del pipeline.flow
+    if getattr(pipeline, "is_moe", False):
+        del pipeline.flow_high
+        del pipeline.flow_low
+    else:
+        del pipeline.flow
     mx.clear_cache()
     peak_mem_generation = mx.get_peak_memory() / 1024**3
     mx.reset_peak_memory()
