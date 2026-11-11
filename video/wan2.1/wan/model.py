@@ -171,8 +171,10 @@ class WanModel(nn.Module):
             new_residual = block_residual  # pass through (caller won't cache this)
         else:
             x_in = x
-            for block in self.blocks:
+            for block_idx, block in enumerate(self.blocks):
                 x = block(x, e, grid_sizes, context)
+                if (block_idx + 1) % 4 == 0:
+                    mx.eval(x)
             new_residual = x - x_in
 
         # Output head

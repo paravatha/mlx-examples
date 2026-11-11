@@ -334,15 +334,17 @@ class WanPipeline:
                     f"({100 * n_skip / num_steps:.0f}%)"
                 )
 
-        if self.is_moe:
-            flow_high = mx.compile(
-                self.flow_high.__call__, inputs=[self.flow_high.state]
-            )
-            flow_low = mx.compile(
-                self.flow_low.__call__, inputs=[self.flow_low.state]
-            )
-        else:
+        # Do not compile the entire 40-layer DiT when token count is large or for MoE models;
+        # monolithic command buffers will exceed the macOS Metal watchdog timeout (~5s).
+        can_compile = (W * H * frame_num) <= (832 * 480 * 9) and not self.is_moe
+        if can_compile:
             flow = mx.compile(self.flow.__call__, inputs=[self.flow.state])
+            flow_high = None
+            flow_low = None
+        else:
+            flow = self.flow
+            flow_high = self.flow_high if self.is_moe else None
+            flow_low = self.flow_low if self.is_moe else None
 
         x_t = x_T
         for step_idx, t in enumerate(sampler.timesteps):
@@ -387,6 +389,8 @@ class WanPipeline:
                     if verbose:
                         logger.info(f"Step {step_idx}/{num_steps}: compute")
 
+                mx.eval(noise_cond)
+
                 if guidance > 1.0:
                     if skip_mask[step_idx]:
                         noise_uncond, _ = curr_flow(
@@ -408,6 +412,7 @@ class WanPipeline:
                             precomputed_time=precomputed,
                         )
                         mx.eval(prev_residual_uncond)
+                    mx.eval(noise_uncond)
                     noise_pred = noise_uncond + guidance * (noise_cond - noise_uncond)
                 else:
                     noise_pred = noise_cond
@@ -420,6 +425,7 @@ class WanPipeline:
                     clip_fea=clip_features,
                     first_frame=first_frame,
                 )
+                mx.eval(noise_cond)
 
                 if guidance > 1.0:
                     noise_uncond, _ = curr_flow(
@@ -429,14 +435,13 @@ class WanPipeline:
                         clip_fea=clip_features,
                         first_frame=first_frame,
                     )
+                    mx.eval(noise_uncond)
                     noise_pred = noise_uncond + guidance * (noise_cond - noise_uncond)
                 else:
                     noise_pred = noise_cond
 
-            # async_eval starts GPU work on x_t and returns immediately,
-            # so the caller's mx.eval blocks less (pipeline overlap).
             x_t = sampler.step(noise_pred, t, x_t)
-            mx.async_eval(x_t)
+            mx.eval(x_t)
             yield x_t
 
     def decode(self, latents: mx.array) -> mx.array:

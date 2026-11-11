@@ -63,7 +63,24 @@ class WanSelfAttention(nn.Module):
         q = q.transpose(0, 2, 1, 3)
         k = k.transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
-        return mx.fast.scaled_dot_product_attention(q, k, v, scale=self.head_dim**-0.5)
+
+        if L > 4096 and n > 8:
+            head_chunk_size = 8
+            num_chunks = (n + head_chunk_size - 1) // head_chunk_size
+            attn_chunks = []
+            scale = self.head_dim**-0.5
+            for i in range(num_chunks):
+                h_start = i * head_chunk_size
+                h_end = min(n, (i + 1) * head_chunk_size)
+                qi = q[:, h_start:h_end]
+                ki = k[:, h_start:h_end]
+                vi = v[:, h_start:h_end]
+                ai = mx.fast.scaled_dot_product_attention(qi, ki, vi, scale=scale)
+                mx.eval(ai)
+                attn_chunks.append(ai)
+            return mx.concatenate(attn_chunks, axis=1)
+        else:
+            return mx.fast.scaled_dot_product_attention(q, k, v, scale=self.head_dim**-0.5)
 
     def __call__(self, x, grid_sizes):
         B, L, C = x.shape
